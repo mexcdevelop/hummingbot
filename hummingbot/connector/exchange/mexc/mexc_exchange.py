@@ -85,6 +85,7 @@ class MexcExchange(ExchangeBase):
     SHORT_POLL_INTERVAL = 5.0
     MORE_SHORT_POLL_INTERVAL = 1.0
     LONG_POLL_INTERVAL = 120.0
+    ORDER_LEN_LIMIT = 20
 
     _logger = None
 
@@ -262,6 +263,8 @@ class MexcExchange(ExchangeBase):
                            limit_id: Optional[str] = None) -> Dict[str, Any]:
 
         headers = {"Content-Type": "application/json"}
+        if path_url in CONSTANTS.MEXC_PLACE_ORDER:
+            headers.update({'source': 'HUMBOT'})
         client = await self._http_client()
         text_data = ujson.dumps(data) if data else None
         limit_id = limit_id or path_url
@@ -313,7 +316,7 @@ class MexcExchange(ExchangeBase):
                 for trading_rule in trading_rules_list:
                     self._trading_rules[trading_rule.trading_pair] = trading_rule
         except Exception as ex:
-            self.logger().error(f"Error _update_trading_rules:" + str(ex), exc_info=True)
+            self.logger().error("Error _update_trading_rules:" + str(ex), exc_info=True)
 
     def _format_trading_rules(self, raw_trading_pair_info: List[Dict[str, Any]]) -> List[TradingRule]:
         trading_rules = []
@@ -457,10 +460,13 @@ class MexcExchange(ExchangeBase):
                 except Exception as ex:
                     self.logger().error("_update_order_status error ..." + repr(ex), exc_info=True)
 
+    def _reset_poll_notifier(self):
+        self._poll_notifier = asyncio.Event()
+
     async def _status_polling_loop(self):
         while True:
             try:
-                self._poll_notifier = asyncio.Event()
+                self._reset_poll_notifier()
                 await self._poll_notifier.wait()
                 await safe_gather(
                     self._update_balances(),
@@ -774,7 +780,7 @@ class MexcExchange(ExchangeBase):
                 f"{decimal_price if order_type is OrderType.LIMIT else ''}."
                 f"{decimal_price}." + ",ex:" + repr(ex),
                 exc_info=True,
-                app_warning_msg=f"Failed to submit sell order to Mexc. Check API key and network connection."
+                app_warning_msg="Failed to submit sell order to Mexc. Check API key and network connection."
             )
             self.trigger_event(self.MARKET_ORDER_FAILURE_EVENT_TAG,
                                MarketOrderFailureEvent(self.current_timestamp, order_id, order_type))
@@ -828,39 +834,49 @@ class MexcExchange(ExchangeBase):
 
         for trading_pair in orders_by_trading_pair:
             cancel_order_ids = [o.exchange_order_id for o in orders_by_trading_pair[trading_pair]]
-            self.logger().debug(f"cancel_order_ids {cancel_order_ids} orders_by_trading_pair[trading_pair]")
-            params = {
-                'order_ids': quote(','.join([o for o in cancel_order_ids])),
-            }
+            is_need_loop = True
+            while is_need_loop:
+                if len(cancel_order_ids) > self.ORDER_LEN_LIMIT:
+                    is_need_loop = True
+                    this_turn_cancel_order_ids = cancel_order_ids[:self.ORDER_LEN_LIMIT]
+                    cancel_order_ids = cancel_order_ids[self.ORDER_LEN_LIMIT:]
+                else:
+                    this_turn_cancel_order_ids = cancel_order_ids
+                    is_need_loop = False
+                self.logger().debug(
+                    f"cancel_order_ids {this_turn_cancel_order_ids} orders_by_trading_pair[trading_pair]")
+                params = {
+                    'order_ids': quote(','.join([o for o in this_turn_cancel_order_ids])),
+                }
 
-            cancellation_results = []
-            try:
-                cancel_all_results = await self._api_request(
-                    "DELETE",
-                    path_url=CONSTANTS.MEXC_ORDER_CANCEL,
-                    params=params,
-                    is_auth_required=True
-                )
+                cancellation_results = []
+                try:
+                    cancel_all_results = await self._api_request(
+                        "DELETE",
+                        path_url=CONSTANTS.MEXC_ORDER_CANCEL,
+                        params=params,
+                        is_auth_required=True
+                    )
 
-                for order_result_client_order_id, order_result_value in cancel_all_results['data'].items():
-                    for o in orders_by_trading_pair[trading_pair]:
-                        if o.client_order_id == order_result_client_order_id:
-                            result_bool = True if order_result_value == "invalid order state" or order_result_value == "success" else False
-                            cancellation_results.append(CancellationResult(o.client_order_id, result_bool))
-                            if result_bool:
-                                self.trigger_event(self.MARKET_ORDER_CANCELLED_EVENT_TAG,
-                                                   OrderCancelledEvent(self.current_timestamp,
-                                                                       order_id=o.client_order_id,
-                                                                       exchange_order_id=o.exchange_order_id))
-                                self.stop_tracking_order(o.client_order_id)
+                    for order_result_client_order_id, order_result_value in cancel_all_results['data'].items():
+                        for o in orders_by_trading_pair[trading_pair]:
+                            if o.client_order_id == order_result_client_order_id:
+                                result_bool = True if order_result_value == "invalid order state" or order_result_value == "success" else False
+                                cancellation_results.append(CancellationResult(o.client_order_id, result_bool))
+                                if result_bool:
+                                    self.trigger_event(self.MARKET_ORDER_CANCELLED_EVENT_TAG,
+                                                       OrderCancelledEvent(self.current_timestamp,
+                                                                           order_id=o.client_order_id,
+                                                                           exchange_order_id=o.exchange_order_id))
+                                    self.stop_tracking_order(o.client_order_id)
 
-            except Exception as ex:
+                except Exception as ex:
 
-                self.logger().network(
-                    f"Failed to cancel all orders: {cancel_order_ids}" + repr(ex),
-                    exc_info=True,
-                    app_warning_msg=f"Failed to cancel all orders on Mexc. Check API key and network connection."
-                )
+                    self.logger().network(
+                        f"Failed to cancel all orders: {this_turn_cancel_order_ids}" + repr(ex),
+                        exc_info=True,
+                        app_warning_msg=f"Failed to cancel all orders on Mexc. Check API key and network connection."
+                    )
         return cancellation_results
 
     def get_order_book(self, trading_pair: str) -> OrderBook:
